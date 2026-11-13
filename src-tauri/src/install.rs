@@ -195,7 +195,8 @@ pub async fn download_split(
     let res = loop {
         tokio::select! {
             r = &mut all => break r,
-            _ = tokio::time::sleep(Duration::from_millis(400)) => {
+            // A few updates a second, so the Downloads graph has points to draw even on a short download.
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
                 let d = done.load(Ordering::Relaxed);
                 if mark.elapsed() >= Duration::from_secs(1) {
                     speed = ((d - mark_bytes) as f64 / mark.elapsed().as_secs_f64()) as u64;
@@ -761,6 +762,53 @@ fn overlay(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// After an update: the files the previous release put in the game's folder that this release no
+/// longer has, removed. Unpacking only adds and replaces, so a source file or library an old
+/// version had stays behind and can break a build or load in place of the new one (DKB Recomp
+/// 0.2.0's runtime/gfx_present.c broke 0.3.0's link with duplicate symbols). A file changed since
+/// that install (settings the game rewrote, a file the player edited) and `keep` (the program the
+/// player starts) stay. Returns what it removed.
+pub fn remove_dropped(target: &Path, old: &[PathBuf], new: &[PathBuf], installed_at: u64, keep: Option<&Path>) -> Vec<PathBuf> {
+    // Case doesn't tell files apart on Windows and Mac: a file only renamed in case is still there.
+    let fold = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let still_shipped: std::collections::HashSet<String> = new.iter().map(|p| fold(p)).collect();
+    let kept = keep.map(fold);
+    let mut removed = vec![];
+    for rel in old {
+        let name = fold(rel);
+        if still_shipped.contains(&name) || kept.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+            continue;
+        }
+        let path = target.join(rel);
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let since = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        let changed = since.map(|d| d.as_secs() > installed_at).unwrap_or(true);
+        if changed || fs::remove_file(&path).is_err() {
+            continue;
+        }
+        remove_empty_parents(target, &path);
+        removed.push(rel.clone());
+    }
+    removed
+}
+
+/// The folders above a removed file that it leaves empty, up to (not including) `top`.
+fn remove_empty_parents(top: &Path, file: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir.filter(|d| *d != top && d.starts_with(top)) {
+        if fs::remove_dir(d).is_err() {
+            return;
+        }
+        dir = d.parent();
+    }
+}
+
 fn replace_bundle(from: &Path, to: &Path) -> io::Result<()> {
     if fs::symlink_metadata(to).is_err() {
         return fs::rename(from, to);
@@ -914,7 +962,7 @@ fn unpack_appimage_in(dir: &Path, staging: &Path) {
 /// anything beside it, not the Applications shortcut or the window's background) copied out with
 /// ditto so the bundle stays whole, then closed again.
 #[cfg(target_os = "macos")]
-fn undmg(file: &Path, staging: &Path) -> Result<(), Error> {
+pub(crate) fn undmg(file: &Path, staging: &Path) -> Result<(), Error> {
     let mount = staging.with_extension("mount");
     let _ = fs::remove_dir(&mount);
     fs::create_dir_all(&mount)?;
@@ -1074,7 +1122,7 @@ const QUICK_WORDS: [&str; 3] = ["play", "quick", "direct"];
 
 /// The version of find_exe's rules. Raise it when they pick better, and installs picked by older
 /// rules get looked at again on their next Play (own_setup::pending).
-pub const EXE_RULES: u8 = 18;
+pub const EXE_RULES: u8 = 19;
 
 /// Words in the name of a program that comes with a game but is one of its tools: a translator,
 /// shader builder, compiler, patcher or dedicated server (xcx_xlate, ultrs-shaders, xbe_recomp,
@@ -1287,6 +1335,17 @@ pub fn is_program(p: &Path, os: &str) -> bool {
     false
 }
 
+/// A program that comes with a game but is never the game: an uninstaller, installer, crash
+/// handler, runtime installer or one of its tools (crashpad_handler.exe, vc_redist.x64.exe,
+/// x86_64-w64-mingw32-clang++.exe). A word that's in the game's own names doesn't count.
+pub fn never_the_game(rel: &Path, names: &[&str]) -> bool {
+    let want: Vec<String> = names.iter().flat_map(|n| tokens(n)).collect();
+    let stem = rel.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    looks_like_setup(rel)
+        || looks_like_tool(rel, names)
+        || tokens(stem).iter().any(|x| !want.contains(x) && NOT_THE_GAME.iter().any(|n| x == n || (n.len() >= 5 && x.starts_with(n))))
+}
+
 /// The program to start, relative to `dir`: the one whose name looks most like the game's, near the
 /// top of the folder, and big (the game is usually the biggest program in its folder).
 pub fn find_exe(dir: &Path, os: &str, names: &[&str]) -> Option<PathBuf> {
@@ -1372,6 +1431,11 @@ pub fn find_exe(dir: &Path, os: &str, names: &[&str]) -> Option<PathBuf> {
                 if t.first().map(|x| QUICK_WORDS.contains(&x.as_str())).unwrap_or(false) {
                     s -= 10;
                 }
+                // A command-line build beside the windowed one (eden-cli.exe next to eden.exe):
+                // it needs options the player would have to type, so the windowed one goes first.
+                if t.last().map(|x| x == "cli" || x == "cmd" || x == "console").unwrap_or(false) {
+                    s -= 25;
+                }
             }
             if t.iter().any(|x| x == "recompiled" || x == "recomp") {
                 s += 10;
@@ -1430,6 +1494,77 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A time after every file a test just wrote: none of them changed since that install.
+    fn later() -> u64 {
+        crate::library::now() + 60
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn an_update_removes_a_file_its_release_dropped() {
+        let d = tmp("dropped-gone");
+        fs::create_dir_all(d.join("runtime")).unwrap();
+        fs::write(d.join("runtime/gfx_present.c"), b"old").unwrap();
+        fs::write(d.join("runtime/gfx_window.c"), b"new").unwrap();
+        let old = paths(&["runtime/gfx_present.c", "runtime/gfx_window.c"]);
+        let new = paths(&["runtime/gfx_window.c"]);
+        let removed = remove_dropped(&d, &old, &new, later(), None);
+        assert_eq!(removed, paths(&["runtime/gfx_present.c"]));
+        assert!(!d.join("runtime/gfx_present.c").exists());
+        assert!(d.join("runtime/gfx_window.c").exists());
+    }
+
+    #[test]
+    fn an_update_keeps_a_dropped_file_changed_since_the_install() {
+        let d = tmp("dropped-changed");
+        fs::write(d.join("game.ini"), b"edited by the player").unwrap();
+        let installed_long_ago = crate::library::now() - 3600;
+        let removed = remove_dropped(&d, &paths(&["game.ini"]), &[], installed_long_ago, None);
+        assert!(removed.is_empty());
+        assert!(d.join("game.ini").exists());
+    }
+
+    #[test]
+    fn an_update_keeps_the_program_the_player_starts() {
+        let d = tmp("dropped-exe");
+        fs::write(d.join("Game.exe"), b"exe").unwrap();
+        let removed = remove_dropped(&d, &paths(&["Game.exe"]), &[], later(), Some(Path::new("Game.exe")));
+        assert!(removed.is_empty());
+        assert!(d.join("Game.exe").exists());
+    }
+
+    #[test]
+    fn an_update_keeps_a_file_only_renamed_in_case() {
+        let d = tmp("dropped-case");
+        fs::write(d.join("Engine.dll"), b"dll").unwrap();
+        let removed = remove_dropped(&d, &paths(&["Engine.dll"]), &paths(&["engine.DLL"]), later(), None);
+        assert!(removed.is_empty());
+        assert!(d.join("Engine.dll").exists());
+    }
+
+    #[test]
+    fn an_update_removes_a_folder_its_dropped_files_leave_empty() {
+        let d = tmp("dropped-folder");
+        fs::create_dir_all(d.join("old/deep")).unwrap();
+        fs::write(d.join("old/deep/a.bin"), b"a").unwrap();
+        remove_dropped(&d, &paths(&["old/deep/a.bin"]), &[], later(), None);
+        assert!(!d.join("old").exists());
+        assert!(d.exists());
+    }
+
+    #[test]
+    fn an_update_never_removes_outside_the_game_folder() {
+        let d = tmp("dropped-outside");
+        fs::create_dir_all(d.join("game")).unwrap();
+        fs::write(d.join("other.txt"), b"not the game's").unwrap();
+        let removed = remove_dropped(&d.join("game"), &paths(&["../other.txt"]), &[], later(), None);
+        assert!(removed.is_empty());
+        assert!(d.join("other.txt").exists());
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1493,6 +1628,22 @@ mod tests {
     fn put(p: &Path, bytes: usize) {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, vec![7u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn the_windowed_program_goes_ahead_of_its_command_line_build() {
+        let d = tmp("cli-build");
+        put(&d.join("eden.exe"), 8_000_000);
+        put(&d.join("eden-cli.exe"), 9_000_000);
+        put(&d.join("crashpad_handler.exe"), 12_000_000);
+        assert_eq!(find_exe(&d, "windows", &["Eden"]).unwrap(), PathBuf::from("eden.exe"));
+        // Never the game, whatever its size; a word in the game's own name doesn't count.
+        assert!(never_the_game(Path::new("crashpad_handler.exe"), &["NX2navi"]));
+        assert!(never_the_game(Path::new("DKB-Setup.exe"), &["Donkey Kong"]));
+        assert!(never_the_game(Path::new("bin/x86_64-w64-mingw32-clang++.exe"), &["DKB"]));
+        assert!(!never_the_game(Path::new("NX2navi.exe"), &["NX2navi"]));
+        assert!(!never_the_game(Path::new("CrashTagTeam.exe"), &["Crash Tag Team Racing"]));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]

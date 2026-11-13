@@ -22,6 +22,8 @@ the launcher sets it up.
 
 - **Discover:** every recomp on recomplauncher.com, with screenshots, what it needs and how it
   runs for other players.
+- **Coming Soon:** the recomps on the way, with Notify Me for an email when each comes out, and
+  Request a Recomp to ask for a project on GitHub or GitLab.
 - **Install and update in one click,** straight from the developer's own GitHub release. Every
   download is checked against GitHub's checksum.
 - **Easy Setup:** point it at your disc image or game folder and it does the rest, for the recomps
@@ -61,6 +63,12 @@ and run it. While the beta is new, Windows may say "Windows protected your PC". 
 **More info**, then **Run anyway**. Each release lists its file's SHA-256 so you can check you
 have the real one.
 
+In **Settings > General > When you close the window**, **Run in background** controls whether
+closing the window keeps RecompLauncher in the system tray. Turn it off to exit the launcher
+and its background work when you close the window. **Quit RecompLauncher** always exits.
+The setting is also available in Big Picture mode. It is off by default for new installations;
+existing saved choices are kept. Games already running keep playing.
+
 ## No game files
 
 RecompLauncher has no game files and never downloads any. Every recomp comes from its developer's
@@ -92,7 +100,7 @@ can read exactly what it does, or build it yourself with the steps in
 
 ## About
 
-Made by [Ripalda](https://github.com/elripalda). If you'd like to support it: [Ko-fi](https://ko-fi.com/ripalda).
+Made by [Ripalda](https://github.com/elripalda). If you'd like to support it: [Ko-fi](https://ko-fi.com/recomp).
 
 RecompLauncher is free to download and use. It isn't affiliated with or endorsed by any game's
 makers or platform holders.

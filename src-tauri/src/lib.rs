@@ -8,6 +8,8 @@ pub mod ach;
 pub mod adopt;
 pub mod xex;
 mod appimage;
+#[cfg(target_os = "linux")]
+mod appimage_update;
 pub mod art;
 pub mod assets;
 pub mod boot;
@@ -29,6 +31,7 @@ pub mod ingame;
 pub mod install;
 pub mod library;
 pub mod looks;
+pub mod mac_update;
 pub mod manage;
 pub mod macos;
 pub mod media;
@@ -49,6 +52,7 @@ mod emus;
 pub mod roms;
 pub mod saves;
 pub mod shortcuts;
+pub mod steam_sync;
 pub mod trail;
 pub mod tray;
 mod update_download;
@@ -536,6 +540,12 @@ async fn do_install(app: &AppHandle, st: &App, id: &str, dir: Option<PathBuf>, t
     })?;
     if !keep {
         let _ = std::fs::remove_file(&got.file);
+    }
+    if let Some(p) = prev.as_ref().filter(|p| p.path == target) {
+        let removed = install::remove_dropped(&target, &p.files, &files, p.updated_at, p.exe.as_deref());
+        if !removed.is_empty() {
+            trail::note(format!("Install {id}: {} files of {} that {tag_got} no longer has, removed", removed.len(), p.tag));
+        }
     }
     // A game whose own setup works from a clone of its repo gets one, around the release's files.
     if boot::Boot::from_entry(&entry).map(|b| b.clone).unwrap_or(false) {
@@ -1982,6 +1992,16 @@ fn installed_or_game(st: &App, id: &str) -> Res<Installed> {
     g.or_else(|| game_of(st, id).map(|p| p.g)).ok_or_else(|| Error::Msg("It isn't installed.".into()))
 }
 
+/// A game's pictures for Steam's grid folder, as (suffix, bytes, extension), and its icon file.
+/// The player's own pictures (Customize) when they have them, else the list's.
+async fn steam_art(st: &App, id: &str, g: &Installed) -> (Vec<(&'static str, Vec<u8>, &'static str)>, String) {
+    let ga = game_art(st, id, g).await;
+    let wide = wide_capsule(&ga.hero.0, &ga.logo.0).map(|b| (b, "jpg")).unwrap_or_else(|| ga.hero.clone());
+    let icon = ga.icon.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let art = vec![("p", ga.cover.0, ga.cover.1), ("_hero", ga.hero.0, ga.hero.1), ("", wide.0, wide.1), ("_logo", ga.logo.0, ga.logo.1)];
+    (art, icon)
+}
+
 /// Add the game to Steam. If Steam is open and `restart` is false, nothing changes and the answer
 /// is "steam_running", so the window can ask first; with `restart`, Steam is closed, the game
 /// added, and Steam started again.
@@ -1998,10 +2018,7 @@ async fn add_to_steam(st: State<'_, App>, id: String, restart: bool) -> Res<Stri
     if was_running && !restart {
         return Ok("steam_running".into());
     }
-    // The player's own pictures (Customize) when they have them, else the list's.
-    let ga = game_art(&st, &id, &g).await;
-    let wide = wide_capsule(&ga.hero.0, &ga.logo.0).map(|b| (b, "jpg")).unwrap_or_else(|| ga.hero.clone());
-    let art = vec![("p", ga.cover.0.clone(), ga.cover.1), ("_hero", ga.hero.0.clone(), ga.hero.1), ("", wide.0, wide.1), ("_logo", ga.logo.0.clone(), ga.logo.1)];
+    let (art, icon) = steam_art(&st, &id, &g).await;
     if was_running {
         if let Some(why) = shortcuts::cant_restart_steam() {
             return Err(Error::Msg(why.into()));
@@ -2009,7 +2026,6 @@ async fn add_to_steam(st: State<'_, App>, id: String, restart: bool) -> Res<Stri
         trail::note(format!("Add to Steam ({id}): closing Steam"));
         shortcuts::close_steam(&steam).await.inspect_err(|e| trail::note(format!("Add to Steam: {e}")))?;
     }
-    let icon = ga.icon.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let name = shown_name(&st, &id, &g).await;
     let n = shortcuts::write_to_steam(&steam, &name, &id, &icon, &art, &st.dir).inspect_err(|e| trail::note(format!("Add to Steam ({id}): {e}")))?;
     trail::note(format!("Add to Steam ({id}): written for {n} account(s) in {}{}", dirs::home_dir().and_then(|h| steam.strip_prefix(h).ok().map(|r| format!("~/{}", r.display()))).unwrap_or_else(|| steam.display().to_string()), if was_running { "" } else { " (Steam was closed)" }));
@@ -2351,6 +2367,15 @@ fn stats_line(l: &str) -> bool {
     WORDS.iter().any(|w| l.contains(w))
 }
 
+/// A line from what runs a game on Linux, not from the game: Proton and its fixes, umu, Wine,
+/// Steam's runtime, and the loader skipping Steam's 32-bit overlay ("ProtonFixes WARN: Game title
+/// not found in CSV", "Proton: Error: unable to use parent for game drive"). Never the reason a
+/// game didn't start. Takes a lowercased line.
+fn runtime_line(l: &str) -> bool {
+    const WORDS: [&str; 10] = ["protonfixes", "proton:", "umu-launcher", "umu:", "pressure-vessel", "steam-runtime", "steamrt", "gameoverlayrenderer", "wine: ", "fsync:"];
+    WORDS.iter().any(|w| l.contains(w)) || (l.contains("ld.so: object") && l.contains("ignored"))
+}
+
 // Games being started right now, so a second Play while the first is still on its way does nothing.
 static STARTING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 struct Starting(String);
@@ -2475,8 +2500,8 @@ fn start_game_with_steam(app: &AppHandle, id: &str, _steam: Option<&sysenv::Stea
             let m = manual.as_ref().unwrap();
             // Set up by hand without game files of its own ("the game asks"), on a game whose
             // profile hands the copy over in a variable (files.how "env"):
-            // the copy chosen in Easy Setup still goes in it. Otherwise the game starts with
-            // nothing and says its data was not found.
+            // the copy chosen in Easy Setup still goes in it. Otherwise the game would start with
+            // nothing and say its data was not found.
             if m.copy.is_none() && (m.how.is_empty() || m.how == "none") {
                 let p = profile_of(&st, id, &g);
                 let by_env = p.as_ref().and_then(|p| p.start.as_ref()).is_some_and(|s| s.env.values().any(|v| v.contains("{game}")));
@@ -2485,12 +2510,8 @@ fn start_game_with_steam(app: &AppHandle, id: &str, _steam: Option<&sysenv::Stea
                         game_env = p.env_vars(&g.path, Some(&c));
                         trail::note(format!("Play {id}: set up by hand, its copy still goes in {}", game_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")));
                     }
-                    // No copy anywhere, for a game that only gets it from that variable: Easy
-                    // Setup asks for it, instead of a start that can only say the data is missing.
-                    (None, Some(p)) => {
-                        trail::note(format!("Play {id}: set up by hand with no copy, asking for it"));
-                        return Err(Error::Msg(format!("NEED_COPY|{}", p.game.as_ref().map(|c| c.label.clone()).unwrap_or_default())));
-                    }
+                    // No copy chosen: the player set it up themselves (some games prepare their
+                    // own data), so it starts as it is. Set up by hand never stops a start.
                     _ => {}
                 }
             }
@@ -2858,6 +2879,10 @@ fn start_game_with_steam(app: &AppHandle, id: &str, _steam: Option<&sysenv::Stea
         } else if ext == "py" && e.kind() == std::io::ErrorKind::NotFound {
             // A Python game, and Python isn't on this PC (Windows' py launcher comes with it).
             Error::Msg(format!("{shown} is a Python program, and Python 3 isn't on this PC. Install it from python.org (on Windows, tick \"Add python.exe to PATH\" in its installer), then press Play again."))
+        } else if matches!(e.raw_os_error(), Some(4551) | Some(4556)) && cfg!(windows) {
+            // ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION: Smart App Control (or a work or school
+            // policy) blocks programs that aren't signed. It has no list of allowed programs.
+            Error::Msg(format!("Smart App Control blocked {shown}, because the program isn't signed. Windows can't allow one game at a time: to play it, turn Smart App Control off in Windows Security → App & browser control → Smart App Control settings (Windows only turns it back on after a reset). On a work or school PC, ask whoever manages it."))
         } else if e.raw_os_error() == Some(1455) && cfg!(windows) {
             // ERROR_COMMITMENT_LIMIT: memory and the page file together are full.
             Error::Msg(format!("Windows ran out of memory to start {shown}. Close other games and apps, and check that the page file is on (Advanced system settings → Performance → Virtual memory), then press Play again."))
@@ -5198,7 +5223,7 @@ fn troubleshoot(st: State<'_, App>, id: String, code: Option<i64>) -> Res<Vec<Ch
         // It said it's missing something (its game files, most often).
         let missing = text.lines().rev().take(80).find(|l| {
             let l = l.to_lowercase();
-            !stats_line(&l) && (l.contains("status=missing") || l.contains("no executable found") || l.contains("could not find") || l.contains("couldn't find") || l.contains("not found") || l.contains("no such file") || l.contains(" missing"))
+            !stats_line(&l) && !runtime_line(&l) && (l.contains("status=missing") || l.contains("no executable found") || l.contains("could not find") || l.contains("couldn't find") || l.contains("not found") || l.contains("no such file") || l.contains(" missing"))
         });
         let needs_copy = prof.as_ref().map(|p| p.game.is_some()).unwrap_or(false);
         let said = |w: &str| text.lines().rev().take(120).any(|l| l.contains(w));
@@ -5208,9 +5233,6 @@ fn troubleshoot(st: State<'_, App>, id: String, code: Option<i64>) -> Res<Vec<Ch
         } else if said("--game_data_root") {
             // An Xbox 360 recomp that takes the game's files from a folder it's given.
             out.push(check("bad", "It needs to be told where your game files are", "This recomp reads your extracted game from a folder given to it when it starts, and its page doesn't set that up yet. Use Set Up By Hand and pick the folder with your game's files (the one with default.xex).", "manual"));
-        } else if said("Required extensions are missing") || said("Missing required extension: VK_") || said("Unable to create instance") {
-            // Vulkan's own words for a graphics driver that can't run it: not a missing file.
-            out.push(check("bad", "Your graphics driver can't run it", "Vulkan couldn't start with the parts this game needs. Update your graphics driver from NVIDIA, AMD or Intel; on a laptop, make sure it uses its faster graphics card.", "driver"));
         } else if said("Required extensions are missing") || said("Missing required extension: VK_") || said("Unable to create instance") {
             // Vulkan's own words for a graphics driver that can't run it: not a missing file.
             out.push(check("bad", "Your graphics driver can't run it", "Vulkan couldn't start with the parts this game needs. Update your graphics driver from NVIDIA, AMD or Intel; on a laptop, make sure it uses its faster graphics card.", "driver"));
@@ -5803,6 +5825,22 @@ fn net_state() -> Value {
     json!({ "offline": net::offline(), "busy": net::busy() })
 }
 
+/// The site answered again after being Offline: the list asked for again (Discover and game
+/// links see what's new) and saves waiting to go up are sent.
+fn back_online(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let st = app.state::<App>();
+        if let Ok(f) = catalog::catalog_refresh(&st.http, &st.dir).await {
+            if !f.offline {
+                note_new_apps(&app, &st, &f.data);
+                let _ = app.emit("catalog-fresh", ());
+            }
+        }
+        cloud::upload_pending(&app).await;
+    });
+}
+
 /// The list for the window. Without `force`, the copy on disk comes back at once (the window never
 /// waits on the network for it) and, when it's more than six hours old, a new one is asked for in
 /// the background and sent as "catalog-fresh". `force`: the player pressed Refresh.
@@ -5826,7 +5864,9 @@ async fn get_catalog(app: AppHandle, st: State<'_, App>, force: bool) -> Res<cat
             return Ok(f);
         }
     }
-    let mut f = catalog::catalog(&st.http, &st.dir, force).await?;
+    // Refresh, or a game link the list on disk doesn't have yet: asked straight away, resting or
+    // not (one question, and the player's own doing).
+    let mut f = if force { net::now(catalog::catalog(&st.http, &st.dir, true)).await? } else { catalog::catalog(&st.http, &st.dir, false).await? };
     merged_mine(&app, &st, &mut f.data);
     if !f.offline {
         note_new_apps(&app, &st, &f.data);
@@ -6128,12 +6168,15 @@ fn linux_entry(v: &Value) -> Option<Value> {
         return None;
     }
     let mut out = v.clone();
-    for k in ["version", "url", "sha256", "notes"] {
+    // A Linux download must never inherit the Windows checksum or required minimum.
+    for k in ["linux", "macos", "url", "sha256", "min", "size"] {
+        out.as_object_mut()?.remove(k);
+    }
+    for k in ["version", "url", "sha256", "notes", "min", "size"] {
         if let Some(x) = l.get(k) {
             out[k] = x.clone();
         }
     }
-    out.as_object_mut()?.remove("linux");
     Some(out)
 }
 
@@ -6576,6 +6619,15 @@ async fn open_mods(app: AppHandle, st: State<'_, App>, id: String) -> Res<()> {
 
 // ---------- reports and the launcher's own updates ----------
 
+/// What a log sent to the website is about, so the admin can sort crash logs: "game" with the game's
+/// id when one game's log goes along, "launcher" with no id otherwise.
+fn log_source(game: Option<&str>) -> [(String, String); 2] {
+    match game.filter(|g| !g.is_empty()) {
+        Some(id) => [("source".into(), "game".into()), ("game".into(), id.into())],
+        None => [("source".into(), "launcher".into()), ("game".into(), String::new())],
+    }
+}
+
 /// Send a crash (the game's log and a note) to RecompLauncher's inbox on recomplauncher.com.
 #[tauri::command]
 async fn send_report(st: State<'_, App>, id: String, message: String, log: Option<String>, kind: Option<String>) -> Res<String> {
@@ -6587,6 +6639,7 @@ async fn send_report(st: State<'_, App>, id: String, message: String, log: Optio
         ("category".into(), category.into()),
         ("message".into(), format!("RecompLauncher {} on {} ({})\n\n{}", env!("CARGO_PKG_VERSION"), assets::os_now(), assets::arch_now(), message.chars().take(1800).collect::<String>())),
     ];
+    form.extend(log_source(Some(&id)));
     // The log the crash screen found: only from the places it looks (the game's folder, the logs
     // folder its profile names, ReShade's log for this game), and only a .log or .txt.
     let logs_dir = profile_of(&st, &id, &g).and_then(|p| p.folder("logs", &g.path));
@@ -6768,6 +6821,7 @@ async fn beta_feedback(st: State<'_, App>, kind: String, area: String, mood: Opt
         ("feedback".into(), match mood.as_deref() { Some("great") | Some("good") => "works", Some("broken") => "crashes", _ => "other" }.into()),
         ("build".into(), format!("RecompLauncher {}", env!("CARGO_PKG_VERSION"))),
     ];
+    form.extend(log_source(game.as_ref().map(|g| g.id.as_str())));
     if attach {
         let dir = st.dir.clone();
         let pc = tokio::task::spawn_blocking(move || usage::pc_info(&dir)).await.unwrap_or_default();
@@ -6832,25 +6886,59 @@ async fn beta_feedback(st: State<'_, App>, kind: String, area: String, mood: Opt
     }
 }
 
+/// A launcher download the updater may fetch: HTTPS from GitHub or recomplauncher.com, or from the
+/// update server itself (`base`, which RL_API can point at a local http copy of the site for
+/// testing). Matched by origin and path, so github.com.evil.example or a sibling path doesn't pass.
+pub(crate) fn trusted_update_url(raw: &str, base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else { return false };
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    let under = |origin: &str| {
+        let Ok(origin) = reqwest::Url::parse(origin) else { return false };
+        let prefix = format!("{}/", origin.path().trim_end_matches('/'));
+        url.origin() == origin.origin() && url.path().starts_with(&prefix)
+    };
+    ["https://github.com", net::SITE, base].into_iter().any(under)
+}
+
 /// Download the newer launcher, check it, and start it: the installer on Windows, the AppImage in
-/// place of this one on Linux. Anything else opens the download page.
+/// place of this one on Linux, the .app from the disk image in place of this one on a Mac. Anything
+/// else opens the download page.
 #[tauri::command]
-async fn update_launcher(app: AppHandle, st: State<'_, App>) -> Res<()> {
+async fn update_launcher(app: AppHandle, st: State<'_, App>, big_picture: Option<bool>) -> Res<()> {
+    let result = update_launcher_inner(&app, &st, big_picture).await;
+    if result.is_err() {
+        let _ = app.emit("self-update", json!({"failed": true}));
+    }
+    result
+}
+
+async fn update_launcher_inner(app: &AppHandle, st: &App, _big_picture: Option<bool>) -> Res<()> {
     if flatpak::sandboxed() {
         return Err(Error::Msg("RecompLauncher updates through Flatpak. Update it from your software center, or run: flatpak update".into()));
     }
     let v = version_json(&st, 600, true).await.ok_or_else(|| Error::Net("Can't reach recomplauncher.com right now. Try again in a bit.".into()))?;
     let page = format!("{}/download", net::SITE);
     // On Linux an AppImage replaces itself; anything else (a .deb) opens the download page.
-    let appimage = if cfg!(target_os = "linux") { std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_file()) } else { None };
     let v = launcher_platform_entry(&v, assets::os_now(), assets::arch_now()).unwrap_or(Value::Null);
+    #[cfg(target_os = "linux")]
+    if let Some(target) = std::env::var_os("APPIMAGE") {
+        // An AppImage reports missing/invalid metadata in the launcher and can be retried there.
+        // A missing image on disk is an error too, not a reason to open a browser.
+        return appimage_update::update(app, st, Path::new(&target), &v, _big_picture.unwrap_or_else(|| BIG_PICTURE.load(Ordering::Relaxed))).await;
+    }
     let file_url = str_of(&v, "url").to_string();
-    let ok_host = file_url.starts_with("https://github.com/") || file_url.starts_with(&format!("{}/", net::SITE)) || file_url.starts_with(&format!("{}/", catalog::base().trim_end_matches('/')));
-    if cfg!(target_os = "macos") {
-        // Mac builds are downloaded and installed by the player; no in-place updater yet.
+    let ok_host = trusted_update_url(&file_url, &catalog::base());
+    // On a Mac the app replaces itself from the release's disk image, when this account can change
+    // the folder it's in. Otherwise (run from the disk image, or from a folder only an administrator
+    // can change) the player gets the disk image to drag in themselves.
+    let mac_app = if cfg!(target_os = "macos") { mac_update::running_bundle().filter(|b| mac_update::can_replace(b)) } else { None };
+    let mac_dmg = file_url.to_ascii_lowercase().ends_with(".dmg");
+    if cfg!(target_os = "macos") && (mac_app.is_none() || !mac_dmg) {
         return open_thing(&app, if ok_host { &file_url } else { &page }, true);
     }
-    if !(cfg!(windows) || appimage.is_some()) || file_url.is_empty() || !ok_host {
+    if !(cfg!(windows) || mac_app.is_some()) || file_url.is_empty() || !ok_host {
         return open_thing(&app, &page, true);
     }
     let mut r = update_download::response(&st.http, &file_url).await?;
@@ -6884,40 +6972,67 @@ async fn update_launcher(app: AppHandle, st: State<'_, App>) -> Res<()> {
         trail::note(format!("The update file for {to_ver} is another version; not offered again"));
         return Err(Error::Msg(format!("The update file for RecompLauncher {to_ver} looks wrong: it's a different version inside. It won't be offered again until it's fixed, and nothing on your PC needs changing.")));
     }
-    if let Some(me) = appimage {
-        // The new AppImage goes next to this one and takes its place, then starts.
-        let new = me.with_extension("new");
-        std::fs::write(&new, &bytes).map_err(|e| Error::Msg(format!("Couldn't save the new version next to this one: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
+    if let Some(bundle) = mac_app {
+        let dmg = std::env::temp_dir().join(format!("RecompLauncher-{to_ver}.dmg"));
+        std::fs::write(&dmg, &bytes).map_err(|e| Error::Msg(format!("Couldn't save the new version: {e}")))?;
+        let (dmg2, bundle2, ver2) = (dmg.clone(), bundle.clone(), to_ver.clone());
+        let put = tokio::task::spawn_blocking(move || mac_update::install(&dmg2, &bundle2, &ver2)).await.map_err(|e| Error::Msg(e.to_string()))?;
+        let _ = std::fs::remove_file(&dmg);
+        match put {
+            Ok(()) => {}
+            Err(mac_update::Failed::OtherVersion(found)) => {
+                update_strike(&st.dir, &to_ver, &file_url, &want, 2);
+                trail::note(format!("The update file for {to_ver} holds {found}; not offered again"));
+                return Err(Error::Msg(format!("The update file for RecompLauncher {to_ver} looks wrong: it's a different version inside. It won't be offered again until it's fixed, and nothing on your Mac needs changing.")));
+            }
+            Err(mac_update::Failed::Msg(m)) => return Err(Error::Msg(m)),
         }
-        std::fs::rename(&new, &me).map_err(|e| {
-            let _ = std::fs::remove_file(&new);
-            Error::Msg(format!("Couldn't replace RecompLauncher with the new version: {e}"))
-        })?;
-        let mut c = std::process::Command::new(&me);
-        sysenv::clean_std(&mut c);
-        c.spawn().map_err(|e| Error::Msg(format!("The new version is in place, but it didn't start: {e}. Open RecompLauncher again.")))?;
+        trail::note(format!("Updated to {to_ver} in place"));
+        if !reopen_after_update(&app) {
+            mac_update::forget_old(&bundle);
+            app.exit(0);
+            return Ok(());
+        }
+        // Noted, so that if the new version fails to start and this one is put back, its next
+        // start tells the player (see update_check_last). No installer to run again on a Mac.
+        let _ = std::fs::write(st.dir.join("update-pending.json"), json!({"to": to_ver, "from": env!("CARGO_PKG_VERSION"), "at": now(), "installer": "", "url": file_url, "sha256": want}).to_string());
+        if let Err(e) = mac_update::start_and_watch(&bundle) {
+            mac_update::forget_old(&bundle);
+            let _ = std::fs::remove_file(st.dir.join("update-pending.json"));
+            return Err(Error::Msg(format!("The new version is in place, but it didn't start: {e}. Open RecompLauncher again.")));
+        }
         app.exit(0);
         return Ok(());
     }
     let file = std::env::temp_dir().join(format!("RecompLauncher-{}-setup.exe", str_of(&v, "version").trim_start_matches('v')));
     std::fs::write(&file, &bytes)?;
+    // It installs with no window of its own (/S), and RecompLauncher opens again after (/R) unless
+    // the player closed it meanwhile. The launcher's window says it's installing, for a moment, then
+    // closes so none of our files are in use (the installer closes any copy still open before it
+    // copies). /UPDATE: it replaces the files in place and leaves the player's shortcuts alone (a
+    // desktop shortcut they deleted stays gone).
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // Quit during that moment: the launcher is on its way out, so nothing starts behind the
+    // player's back, and the next start doesn't take the update for one that failed.
+    if update_launch::quitting() {
+        return Ok(());
+    }
     // Noted, so the next start can tell whether it went in (see update_check_last).
     let _ = std::fs::write(st.dir.join("update-pending.json"), json!({"to": str_of(&v, "version").trim_start_matches('v'), "from": env!("CARGO_PKG_VERSION"), "at": now(), "installer": file, "url": file_url, "sha256": want}).to_string());
-    // It installs with no window of its own (/S), and RecompLauncher opens again after (/R). The
-    // launcher's window says it's installing, for a moment, then closes so none of our files are in
-    // use (the installer closes any copy still open before it copies). /UPDATE: it replaces the
-    // files in place and leaves the player's shortcuts alone (a desktop shortcut they deleted stays gone).
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     let portable = portable_dir().and_then(|_| exe_dir());
-    update_launch::installer_command(&file, portable.as_deref(), true)
+    let reopen = reopen_after_update(&app);
+    update_launch::installer_command(&file, portable.as_deref(), update_launch::Install::Quiet { reopen })
         .spawn()
         .map_err(|e| if is_blocked(&e) { defender_msg(e, "the installer") } else { Error::Msg(format!("Couldn't start the installer: {e}")) })?;
     app.exit(0);
     Ok(())
+}
+
+/// Whether the launcher opens again after its own update: only while the player still has its
+/// window. Checked as the update goes in, so a window opened again from the tray counts.
+fn reopen_after_update(app: &AppHandle) -> bool {
+    let shown = app.get_webview_window("main").is_some_and(|w| w.is_visible().unwrap_or(true));
+    update_launch::reopen_after(shown, update_launch::quitting())
 }
 
 // ---------- the launcher ----------
@@ -6951,10 +7066,13 @@ fn get_state(st: State<'_, App>) -> Value {
         "pictures": ingame::shots_dir("").parent().map(|p| p.to_string_lossy().to_string()),
         "deck": shortcuts::is_steam_deck(),
         "bigArg": std::env::args().any(|a| a == "--bigpicture"),
+        "desktopArg": std::env::args().any(|a| a == "--desktop"),
         "missing": missing,
         // Where the web view can't play a sound (an AppImage, run as one or unpacked, or a PC
         // without GStreamer's base plugins) it stops the moment one starts. The page then plays none.
         "noSound": no_sound(),
+        // Where the web view draws on the processor, the page leaves out what keeps moving.
+        "cpuDraw": cpu_draw(),
         "updateFailed": UPDATE_FAILED.lock().unwrap().clone(),
     })
 }
@@ -6963,6 +7081,14 @@ fn get_state(st: State<'_, App>) -> Value {
 fn no_sound() -> bool {
     #[cfg(target_os = "linux")]
     return !sysenv::sound_works();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// The web view draws on the processor here (see sysenv::draws_on_cpu).
+fn cpu_draw() -> bool {
+    #[cfg(target_os = "linux")]
+    return sysenv::draws_on_cpu();
     #[cfg(not(target_os = "linux"))]
     false
 }
@@ -6999,7 +7125,7 @@ fn update_retry(app: AppHandle) -> Res<()> {
         return Err(Error::Msg("The installer isn't there anymore. Use Update again to download it.".into()));
     }
     let portable = portable_dir().and_then(|_| exe_dir());
-    update_launch::installer_command(Path::new(&installer), portable.as_deref(), false).spawn().map_err(|e| if is_blocked(&e) { defender_msg(e, "the installer") } else { Error::Msg(format!("Couldn't start the installer: {e}")) })?;
+    update_launch::installer_command(Path::new(&installer), portable.as_deref(), update_launch::Install::Shown).spawn().map_err(|e| if is_blocked(&e) { defender_msg(e, "the installer") } else { Error::Msg(format!("Couldn't start the installer: {e}")) })?;
     app.exit(0);
     Ok(())
 }
@@ -7022,6 +7148,7 @@ fn save_settings(st: State<'_, App>, settings: Settings) -> Res<()> {
     l.settings.tray_told |= told;
     l.settings.save_dir = save_dir;
     (l.settings.proxy, l.settings.proxy_url, l.settings.proxy_user, l.settings.proxy_pass) = proxy;
+    pads::STICK.store(l.settings.pad_stick, Ordering::Relaxed);
     l.save(&st.dir)?;
     Ok(())
 }
@@ -7239,6 +7366,28 @@ pub(crate) fn build_overlay(app: &AppHandle) -> tauri::Result<tauri::WebviewWind
 
 /// The main window is out of sight (minimized, or closed to the tray).
 static AWAY: AtomicBool = AtomicBool::new(false);
+
+/// Set by the page once its first real screen is drawn. The window stays hidden until then, so the
+/// player never sees the empty first draw being replaced by the real one.
+static UI_READY: AtomicBool = AtomicBool::new(false);
+
+/// How long to wait for the page before showing the window anyway (a slow or broken start must
+/// still open a window).
+const UI_READY_WAIT_MS: u64 = 4000;
+
+#[tauri::command]
+fn ui_ready() {
+    UI_READY.store(true, Ordering::Relaxed);
+}
+
+async fn wait_for_ui() {
+    let step = std::time::Duration::from_millis(20);
+    let mut waited = 0;
+    while !UI_READY.load(Ordering::Relaxed) && waited < UI_READY_WAIT_MS {
+        tokio::time::sleep(step).await;
+        waited += 20;
+    }
+}
 // Whether the last Play came from Big Picture mode, for RECOMPLAUNCHER_MODE.
 static BIG_PICTURE: AtomicBool = AtomicBool::new(false);
 /// This PC is a handheld (worked out once at start).
@@ -7790,6 +7939,8 @@ fn single_instance<R: tauri::Runtime>() -> tauri_plugin_single_instance::Builder
 pub fn run() {
     #[cfg(target_os = "linux")]
     sysenv::prepare_start(data_dir_early());
+    #[cfg(target_os = "linux")]
+    flatpak::name_windows_after_app();
     if wait_for_play(&std::env::args().collect::<Vec<_>>()) {
         return;
     }
@@ -7820,8 +7971,8 @@ pub fn run() {
                         return;
                     }
                     ready_look(&app, &rid).await;
-                    cloud::sync_quiet(&app, &rid).await;
-                    if let Err(e) = start_game_with_steam(&app, &id, steam.as_ref()) {
+                    let sync = cloud::sync_quiet(&app, &id).await;
+                    if let Err(e) = sync.and_then(|()| start_game_with_steam(&app, &id, steam.as_ref())) {
                         show_main(&app);
                         let _ = app.emit("toast", e.to_string());
                     }
@@ -7839,20 +7990,18 @@ pub fn run() {
                 return;
             }
             match ev {
-                // With the tray on, X hides the window and the launcher keeps going by the clock.
+                // Run in background hides the window only when the tray can bring it back.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = w.app_handle();
-                    let tray = app.state::<App>().lib.lock().unwrap().settings.close_to_tray;
-                    if tray && app.tray_by_id("main").is_some() {
-                        api.prevent_close();
-                        let _ = w.hide();
+                    let background = app.state::<App>().lib.lock().unwrap().settings.close_to_tray;
+                    api.prevent_close();
+                    if background && app.tray_by_id("main").is_some() && w.hide().is_ok() {
                         away(w, true);
                         tray::hid(app);
                     } else {
                         // Closing for real: the whole launcher goes. The hidden quick-menu window
                         // would otherwise keep it running with no window, and opening it again
                         // would find nothing to show.
-                        api.prevent_close();
                         app.exit(0);
                     }
                 }
@@ -7915,6 +8064,10 @@ pub fn run() {
             }
             trail::start(&dir);
             update_check_last(&dir);
+            #[cfg(target_os = "linux")]
+            if let Some(image) = std::env::var_os("APPIMAGE") {
+                appimage_update::clean_stale(Path::new(&image));
+            }
             // Downloads slow down while a game is running (if the player wants that).
             {
                 let h = app.handle().clone();
@@ -7951,6 +8104,21 @@ pub fn run() {
                 }
             }
             net::init(app.handle());
+            net::on_back(back_online);
+            // While Offline, the site is asked again once its rest is over (five minutes at most),
+            // so the mark clears by itself when the site is back.
+            {
+                let app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        if net::offline() {
+                            let http = app.state::<App>().http.clone();
+                            net::probe(&http).await;
+                        }
+                    }
+                });
+            }
             proton::set_data(&dir);
             // The files an update moved aside (they were in use while it copied).
             #[cfg(windows)]
@@ -8004,7 +8172,7 @@ pub fn run() {
                 let _ = lib.save(&dir);
             }
             // Big Picture at start only once setup is done: the first-run setup is always in a window.
-            let tv = (lib.settings.start_in_tv || std::env::args().any(|a| a == "--bigpicture")) && lib.settings.setup_done;
+            let tv = !std::env::args().any(|a| a == "--desktop") && (lib.settings.start_in_tv || std::env::args().any(|a| a == "--bigpicture")) && lib.settings.setup_done;
             // ReShade left in a game's folder by a start that didn't finish (the launcher closed
             // while the game ran): taken away now.
             {
@@ -8090,12 +8258,15 @@ pub fn run() {
                     HANDHELD.store(shortcuts::is_handheld(&pc.cpu), Ordering::Relaxed);
                 });
             }
+            pads::STICK.store(app.state::<App>().lib.lock().unwrap().settings.pad_stick, Ordering::Relaxed);
             pads::start(app.handle().clone());
             if let Err(e) = tray::start(app.handle()) {
                 eprintln!("No tray icon: {e}");
             }
             // Games sent from the website, while signed in.
             cloud::watch_inbox(app.handle().clone());
+            // Settings → Keep Steam in Sync: written whenever Steam is found closed.
+            steam_sync::start(app.handle().clone());
             // A new RecompLauncher: the window looks as it opens; after that, every six hours or so
             // while it runs (it may stay by the clock). A push brings news of a new build sooner.
             {
@@ -8147,8 +8318,8 @@ pub fn run() {
                             return;
                         }
                         ready_look(&handle, &rid).await;
-                        cloud::sync_quiet(&handle, &rid).await;
-                        if let Err(e) = start_game(&handle, &id) {
+                        let sync = cloud::sync_quiet(&handle, &id).await;
+                        if let Err(e) = sync.and_then(|()| start_game(&handle, &id)) {
                             show_main(&handle);
                             let _ = handle.emit("toast", e.to_string());
                         }
@@ -8157,17 +8328,21 @@ pub fn run() {
                 None => {
                     if let Some(w) = app.get_webview_window("main") {
                         restore_window_place(&w, &app.state::<App>().dir);
+                    }
+                    tauri::async_runtime::spawn(async move {
+                        wait_for_ui().await;
+                        let Some(w) = handle.get_webview_window("main") else { return };
                         if tv {
                             let _ = w.set_fullscreen(true);
                         }
                         let _ = w.show();
-                    }
+                    });
                 }
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            take_link, pause, download_limits, installer::installer_run, installer::installer_cancel, installer::installer_check, installer::installer_done,
+            take_link, ui_ready, pause, download_limits, installer::installer_run, installer::installer_cancel, installer::installer_check, installer::installer_done,
             precheck_copy,
             emulator_folders,
             games_rom_folder,
@@ -8203,20 +8378,29 @@ pub fn run() {
             take_setup_asked,
             get_state, get_catalog, get_releases, net_state, check_updates, launcher_update, install, cancel, uninstall, play, stop, set_exe, open_folder,
             save_settings, open_url, libraries, move_game, game_sizes, backups, backup_now, restore_backup, pc_check, set_ui_scale, update_retry, ge_proton_install, proton_now, repo_readme, install_vcredist, scan_roms, rom_matches, copy_files, support_local,
-            desktop_shortcut, open_app_control, fs_paste, portable_info, make_portable, add_to_steam, launcher_to_steam, recent_log, screenshots, open_shots, overlay_action, overlay_state, is_handheld, skip_backup, set_cover, art::art_source, art::art_open, art::art_save, art::art_search, art::art_for, all_screenshots, delete_screenshot,
+            desktop_shortcut, open_app_control, fs_paste, portable_info, make_portable, add_to_steam, launcher_to_steam, steam_sync::steam_sync_now, steam_sync::steam_sync_state, recent_log, screenshots, open_shots, overlay_action, overlay_state, is_handheld, skip_backup, set_cover, art::art_source, art::art_open, art::art_save, art::art_search, art::art_for, all_screenshots, delete_screenshot,
             copy_screenshot, show_screenshot, controllers, prefetch_images, versions, build_check, news, game_info, mods_state, mods_online,
             mod_install, mod_remove, open_mods, send_report, beta_feedback, game_programs, run_program, game_root, boot::boot_builtin, update_launcher, resume_game, game_setup, set_game_copy, set_update_copy, set_game_setting, set_game_slider, set_game_binding, reset_game_bindings, usage::report_preview, usage::profile_report, usage::my_reports, usage::report_reply,
             recomp_games, adopt::move_listing, update_info, set_proxy, umu_repair, dlss_fetch, dlss_set, dlss_state, dlss_remove, cloud::library_pull, cloud::library_push, cloud::saves_open_backups, game_action, setup_copy, setup_cancel, setup_input_set, setup_key_remove, setup_inputs_run, easy_setup, set_game_options, looks_info, set_look, look_picture, ui_data,
             reset_settings, tray::tray_words, ach::ach_access, ach::ach_status, ach::ach_apply, ach::ach_profile, ach::ach_games, ach::ach_board, ach::ach_game_web, ach::ach_report, ach::ach_tracker_get, ach::ach_game, ach::ach_set_disc, ach::ach_sound, ach::ach_log, ach::ach_peek, ach::ach_rule, ach::ach_reset, ach::ach_test_toast, ach::ach_toast_take, ach::ach_toast_done, cloud::account_start, cloud::account_poll, cloud::account_cancel, cloud::account_state, cloud::account_signout,
-            cloud::saves_check, cloud::saves_pick, cloud::saves_cloud, download_history, report_counts, play_reports, cloud::saves_info, cloud::saves_upload_now, cloud::cloud_retry, cloud::saves_overview, cloud::saves_backup, cloud::saves_restore, cloud::saves_forget_found, cloud::saves_set_place, cloud::saves_add_place, cloud::saves_remove_place, cloud::saves_open, saves_set_root, saves_open_root, missing_files, missing_made, dll_check, dll_aside, gpu_choice, prefer_fast_gpu, copy_check, wine_tools, deck_scores, team_notes, usage::notifies, usage::notify,
-            adopt::adopt_scan, adopt::adopt_pick, adopt::adopt_add, adopt::adopt_check, adopt::set_project, usage::usage_hello, usage::usage_event, usage::data_ids, usage::reset_ids, ping::usage_open, ping::usage_mode, usage::run_report, cloud::inbox, cloud::inbox_done, cloud::betas, cloud::beta_join, cloud::beta_leave, launcher_notes, scan_info, devtools::dev_add, devtools::add_any, devtools::dev_check, devtools::dev_starter, fs_places, fs_list, fs_extract, gb_mods, gb_mod, gb_install
+            cloud::saves_check, cloud::saves_pick, cloud::saves_cloud, download_history, report_counts, play_reports, cloud::saves_info, cloud::saves_upload_now, cloud::cloud_retry, cloud::saves_overview, cloud::saves_backup, cloud::saves_restore, cloud::saves_share, cloud::saves_forget_found, cloud::saves_set_place, cloud::saves_add_place, cloud::saves_remove_place, cloud::saves_open, saves_set_root, saves_open_root, missing_files, missing_made, dll_check, dll_aside, gpu_choice, prefer_fast_gpu, copy_check, wine_tools, deck_scores, team_notes, usage::notifies, usage::notify, usage::pc_specs, usage::recomp_request,
+            adopt::adopt_scan, adopt::migrate_scan, adopt::migrate_pick, adopt::adopt_pick, adopt::adopt_add, adopt::adopt_check, adopt::set_project, usage::usage_hello, usage::usage_event, usage::data_ids, usage::reset_ids, ping::usage_open, ping::usage_mode, usage::run_report, cloud::inbox, cloud::inbox_done, cloud::betas, cloud::beta_join, cloud::beta_leave, launcher_notes, scan_info, devtools::dev_add, devtools::add_any, devtools::dev_check, devtools::dev_starter, fs_places, fs_list, fs_extract, gb_mods, gb_mod, gb_install
         ])
         .build(tauri::generate_context!())
         .expect("RecompLauncher couldn't start")
         .run(|app, ev| {
-            if let tauri::RunEvent::Exit = ev {
-                pads::stop();
-                ping::close(app);
+            match ev {
+                #[cfg(target_os = "macos")]
+                // Dock and Finder must restore the main window even if a helper window is visible.
+                tauri::RunEvent::Reopen { .. } => show_main(app),
+                // Every way out (the window, the tray's Quit, --quit) asks here first. An update still
+                // on its way then leaves the launcher closed (see update_launcher).
+                tauri::RunEvent::ExitRequested { .. } => update_launch::note_quitting(),
+                tauri::RunEvent::Exit => {
+                    pads::stop();
+                    ping::close(app);
+                }
+                _ => {}
             }
         });
 }
@@ -8402,6 +8586,10 @@ mod tests {
         assert!(super::stats_line("[host] frametime: 60 s: 3509 frames in 60.0 s, mean 58.5 fps"));
         assert!(!super::stats_line("error: default.xex is missing"));
         assert!(!super::stats_line("could not find game data in ./assets"));
+        for l in ["ProtonFixes[56194] WARN: Game title not found in CSV", "Proton: Error: unable to use parent for game drive, path /run/media/duke/GamingDrive", "ERROR: ld.so: object '/home/wes/.local/share/Steam/steamrt32/gameoverlayrenderer.so' from LD_PRELOAD cannot be preloaded (wrong ELF class: ELFCLASS32): ignored."] {
+            assert!(super::runtime_line(&l.to_lowercase()), "{l}");
+        }
+        assert!(!super::runtime_line("error: default.xex is missing"));
     }
 
     #[test]
@@ -8623,6 +8811,18 @@ mod tests {
     }
 
     #[test]
+    fn logs_for_the_website_say_whether_a_game_or_the_launcher_sent_them() {
+        let f = log_source(Some("some-game"));
+        assert_eq!(f[0], ("source".to_string(), "game".to_string()));
+        assert_eq!(f[1], ("game".to_string(), "some-game".to_string()));
+        for none in [None, Some("")] {
+            let f = log_source(none);
+            assert_eq!(f[0].1, "launcher");
+            assert_eq!(f[1], ("game".to_string(), String::new()));
+        }
+    }
+
+    #[test]
     fn a_replaced_listing_moves_only_when_asked_and_keeps_everything() {
         let d = std::env::temp_dir().join(format!("rl-replaced-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -8810,6 +9010,31 @@ mod tests {
         assert!(launcher_platform_entry(&feed, "macos", "arm64").is_none());
         assert_eq!(launcher_platform_entry(&feed, "windows", "x64").unwrap()["url"], "https://example.com/windows.exe");
         assert_eq!(launcher_platform_entry(&feed, "linux", "x64").unwrap()["url"], "https://example.com/linux.AppImage");
+    }
+
+    #[test]
+    fn launcher_update_downloads_only_from_trusted_places() {
+        let base = "http://127.0.0.1:8787/api";
+        for ok in ["https://github.com/o/r/releases/download/v1/a.exe", "https://recomplauncher.com/launcher/a.exe", "http://127.0.0.1:8787/api/launcher/a.exe"] {
+            assert!(trusted_update_url(ok, base), "{ok}");
+        }
+        for bad in ["http://github.com/a.exe", "https://github.com.evil.example/a.exe", "https://name@github.com/a.exe", "https://github.com/a.exe#x", "http://127.0.0.1:8787/api-evil/a.exe", "not a url"] {
+            assert!(!trusted_update_url(bad, base), "{bad}");
+        }
+    }
+
+    #[test]
+    fn linux_launcher_update_uses_its_own_checksum_and_minimum() {
+        let feed = json!({"version":"999.0", "sha256":"windows-sha", "min":"999.0", "size":12,
+            "linux":{"url":"https://github.com/owner/repo/Launcher.AppImage"}});
+        let linux = linux_entry(&feed).unwrap();
+        assert_eq!(linux["version"], "999.0");
+        for key in ["sha256", "min", "size", "linux"] { assert!(linux.get(key).is_none(), "{key}"); }
+        let mut own = feed;
+        own["linux"]["sha256"] = json!("linux-sha");
+        own["linux"]["min"] = json!("1.0");
+        assert_eq!(linux_entry(&own).unwrap()["sha256"], "linux-sha");
+        assert_eq!(linux_entry(&own).unwrap()["min"], "1.0");
     }
 
     #[test]

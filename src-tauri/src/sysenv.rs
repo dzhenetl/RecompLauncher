@@ -19,18 +19,29 @@ const SINGLE: [&str; 5] = ["PYTHONHOME", "GTK_EXE_PREFIX", "GTK_DATA_PREFIX", "G
 /// One change to make: a variable set to a value, or taken away.
 type Change = (&'static str, Option<OsString>);
 
+// Marks the NVIDIA setting added by this launcher, so games keep the player's own sync policy.
+const OWN_NV_SYNC: &str = "RL_WEBKIT_NV_SYNC";
+const OWN_WEBKIT_SHM: &str = "RL_WEBKIT_SHM";
+
 fn inside(entry: &str, appdir: &str) -> bool {
     (!appdir.is_empty() && entry.starts_with(appdir)) || entry.contains("/.mount_") || entry.contains("/tmp/appimage")
 }
 
-/// What has to change, worked out once. Empty when the launcher isn't an AppImage.
+/// AppImage paths and launcher-added graphics settings to remove from child programs.
 pub fn changes_from(get: &dyn Fn(&str) -> Option<String>) -> Vec<Change> {
+    let mut out = Vec::new();
+    if get(OWN_NV_SYNC).as_deref() == Some("1") {
+        out.extend([(OWN_NV_SYNC, None), ("__NV_DISABLE_EXPLICIT_SYNC", None)]);
+    }
+    if get(OWN_WEBKIT_SHM).as_deref() == Some("1") {
+        out.extend([(OWN_WEBKIT_SHM, None), ("WEBKIT_DMABUF_RENDERER_FORCE_SHM", None)]);
+    }
     let appdir = get("APPDIR").unwrap_or_default();
     if appdir.is_empty() && get("APPIMAGE").is_none() {
-        return vec![];
+        return out;
     }
     let appdir = appdir.trim_end_matches('/').to_string();
-    let mut out: Vec<Change> = OWN.iter().filter(|k| get(k).is_some()).map(|k| (*k, None)).collect();
+    out.extend(OWN.iter().filter(|k| get(k).is_some()).map(|k| (*k, None)));
     for k in LISTS {
         let Some(v) = get(k) else { continue };
         let kept: Vec<&str> = v.split(':').filter(|e| !e.is_empty() && !inside(e, &appdir)).collect();
@@ -93,23 +104,28 @@ pub fn prepare_start(data: Option<std::path::PathBuf>) {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     let gamescope = var("XDG_CURRENT_DESKTOP").eq_ignore_ascii_case("gamescope") || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some();
     let from_steam = ["SteamGameId", "SteamAppId", "SteamClientLaunch", "SteamEnv"].iter().any(|k| std::env::var_os(k).is_some());
-    // On NVIDIA under Wayland, shared-memory frame transfer avoids blank DMA-BUF frames while
-    // keeping GPU rendering. Disabling the renderer entirely makes scrolling costly in newer WebKit.
+    // Avoid forcing every NVIDIA Wayland window through the legacy renderer: at high display
+    // scales even Settings can fall to ~4 fps. Disabling NVIDIA's explicit sync preserves the
+    // accelerated path while avoiding the Wayland protocol error (Tauri #9394, WebKit #324551).
     let nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
     let appimage = std::env::var_os("APPIMAGE").is_some();
     // The player's choice in Settings → Appearance wins over the guess; their own variables win over both.
     let mode = data.map(|d| graphics_mode(&d)).unwrap_or_default();
-    let hardware = has_hardware_rendering();
     let wayland = (std::env::var_os("WAYLAND_DISPLAY").is_some() || var("XDG_SESSION_TYPE").eq_ignore_ascii_case("wayland")) && !var("GDK_BACKEND").starts_with("x11");
-    let shared_memory = graphics_shared_memory(&mode, gamescope, from_steam, nvidia, wayland, hardware);
-    if shared_memory && std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() {
-        std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
+    let graphics = graphics_workarounds(&mode, gamescope, from_steam, nvidia, wayland, appimage, has_hardware_rendering());
+    if graphics.explicit_sync_off && std::env::var_os("__NV_DISABLE_EXPLICIT_SYNC").is_none() {
+        std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
+        std::env::set_var(OWN_NV_SYNC, "1");
     }
-    let safe_way = graphics_safe_way(&mode, gamescope, from_steam, nvidia, appimage, hardware);
-    if !shared_memory && safe_way && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+    // Keep GPU rendering while avoiding direct DMA-BUF frame sharing on NVIDIA Wayland.
+    if graphics.shared_memory && std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() {
+        std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
+        std::env::set_var(OWN_WEBKIT_SHM, "1");
+    }
+    if graphics.dmabuf_off && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
-    if !shared_memory && compositing_off(&mode, nvidia, wayland) && std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+    if graphics.compositing_off && std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
     }
     if std::env::var_os("RL_STEAM_CLEAN").is_some() {
@@ -178,31 +194,51 @@ fn graphics_mode(data: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// Whether Auto mode has to use WebKit's safe renderer: the cases where its default (DMA-BUF)
-/// renderer is known to leave the window blank. "fast" and "safe" are the player's own choice.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Default, PartialEq)]
+struct GraphicsWorkarounds {
+    dmabuf_off: bool,
+    compositing_off: bool,
+    explicit_sync_off: bool,
+    shared_memory: bool,
+}
+
+/// Direct NVIDIA Wayland launches keep acceleration, with shared-memory frame transfer and
+/// the explicit-sync fix. Shared memory is still an accelerated renderer, not the CPU fallback.
+/// Steam/Gamescope, NVIDIA on X11, and AppImages without a render node retain their fallback.
+/// Faster and Safer remain explicit choices; environment overrides are applied at startup.
+#[cfg(any(test, target_os = "linux"))]
+fn graphics_workarounds(mode: &str, gamescope: bool, from_steam: bool, nvidia: bool, wayland: bool, appimage: bool, hardware: bool) -> GraphicsWorkarounds {
+    match mode {
+        "fast" => GraphicsWorkarounds::default(),
+        "safe" => GraphicsWorkarounds { dmabuf_off: true, compositing_off: true, explicit_sync_off: false, shared_memory: false },
+        _ if nvidia && wayland && hardware && !gamescope && !from_steam => GraphicsWorkarounds {
+            explicit_sync_off: true, shared_memory: true, ..Default::default()
+        },
+        _ => GraphicsWorkarounds {
+            dmabuf_off: gamescope || from_steam || nvidia || (appimage && !hardware),
+            compositing_off: nvidia && wayland,
+            explicit_sync_off: false,
+            shared_memory: false,
+        },
+    }
+}
+
+/// Whether the web view draws on the processor: WebKit's safe renderer or its compositing is
+/// off, or there's no GPU to draw with. Every frame of anything that keeps moving is then painted
+/// by the processor at the window's full size; the hero's slow zoom alone kept a whole core busy
+/// while the launcher just sat there. The page leaves such things out (body.cpu-draw).
 #[cfg(target_os = "linux")]
-fn graphics_safe_way(mode: &str, gamescope: bool, from_steam: bool, nvidia: bool, appimage: bool, hardware: bool) -> bool {
-    match mode {
-        "fast" => false,
-        "safe" => true,
-        _ => gamescope || from_steam || nvidia || (appimage && !hardware),
-    }
+pub fn draws_on_cpu() -> bool {
+    static CPU: OnceLock<bool> = OnceLock::new();
+    *CPU.get_or_init(|| draws_on_cpu_from(&|k| std::env::var(k).ok(), has_hardware_rendering()))
 }
 
-/// Whether WebKit's compositing has to go too. On NVIDIA under Wayland, with it on, Big Picture
-/// shows only its background colour; "fast" and "safe" are the player's own choice.
+/// WebKit reads these as on when they're set to anything but "0".
 #[cfg(any(test, target_os = "linux"))]
-fn compositing_off(mode: &str, nvidia: bool, wayland: bool) -> bool {
-    match mode {
-        "fast" => false,
-        "safe" => true,
-        _ => nvidia && wayland,
-    }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn graphics_shared_memory(mode: &str, gamescope: bool, from_steam: bool, nvidia: bool, wayland: bool, hardware: bool) -> bool {
-    mode.is_empty() && !gamescope && !from_steam && nvidia && wayland && hardware
+fn draws_on_cpu_from(get: &dyn Fn(&str) -> Option<String>, hardware: bool) -> bool {
+    let on = |k: &str| get(k).is_some_and(|v| v != "0");
+    !hardware || on("WEBKIT_DISABLE_DMABUF_RENDERER") || on("WEBKIT_DISABLE_COMPOSITING_MODE")
 }
 
 /// Whether the web view can play a sound. It plays through GStreamer: an AppImage (run as one or
@@ -456,36 +492,100 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn compositing_goes_on_nvidia_under_wayland() {
-        assert!(compositing_off("", true, true));
-        assert!(!compositing_off("", true, false));
-        assert!(!compositing_off("", false, true));
-        assert!(!compositing_off("fast", true, true));
-        assert!(compositing_off("safe", false, false));
+    fn auto_keeps_acceleration_on_direct_nvidia_wayland_launches() {
+        let accelerated = GraphicsWorkarounds { explicit_sync_off: true, shared_memory: true, ..Default::default() };
+        for appimage in [false, true] {
+            assert_eq!(graphics_workarounds("", false, false, true, true, appimage, true), accelerated);
+        }
+        // Steam/Gamescope and a missing render node retain the old fallback, even on Wayland.
+        let fallback = GraphicsWorkarounds { dmabuf_off: true, compositing_off: true, explicit_sync_off: false, shared_memory: false };
+        assert_eq!(graphics_workarounds("", true, false, true, true, false, true), fallback);
+        assert_eq!(graphics_workarounds("", false, true, true, true, false, true), fallback);
+        assert_eq!(graphics_workarounds("", false, false, true, true, false, false), fallback);
     }
 
     #[test]
-    fn desktop_nvidia_wayland_keeps_gpu_rendering_with_shared_memory() {
-        assert!(graphics_shared_memory("", false, false, true, true, true));
+    fn direct_nvidia_wayland_uses_shared_memory_without_disabling_acceleration() {
+        let graphics = graphics_workarounds("", false, false, true, true, false, true);
+        assert!(graphics.shared_memory);
+        assert!(graphics.explicit_sync_off);
+        assert!(!graphics.dmabuf_off);
+        assert!(!graphics.compositing_off);
     }
 
     #[test]
-    fn explicit_graphics_modes_do_not_select_the_auto_shared_memory_path() {
-        assert!(!graphics_shared_memory("fast", false, false, true, true, true));
-        assert!(!graphics_shared_memory("safe", false, false, true, true, true));
+    fn explicit_graphics_modes_override_platform_detection() {
+        for nvidia in [false, true] {
+            for wayland in [false, true] {
+                for steam in [false, true] {
+                    assert_eq!(graphics_workarounds("fast", steam, steam, nvidia, wayland, true, true), GraphicsWorkarounds::default());
+                    assert_eq!(graphics_workarounds("safe", steam, steam, nvidia, wayland, true, true), GraphicsWorkarounds {
+                        dmabuf_off: true, compositing_off: true, explicit_sync_off: false, shared_memory: false,
+                    });
+                }
+            }
+        }
     }
 
     #[test]
-    fn steam_and_gamescope_keep_their_existing_renderer() {
-        assert!(!graphics_shared_memory("", true, false, true, true, true));
-        assert!(!graphics_shared_memory("", false, true, true, true, true));
+    fn games_do_not_inherit_the_launchers_nvidia_sync_workaround() {
+        let env = HashMap::from([(OWN_NV_SYNC, "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]);
+        let changes = changes_from(&|k| env.get(k).map(|s| s.to_string()));
+        assert!(changes.contains(&(OWN_NV_SYNC, None)));
+        assert!(changes.contains(&("__NV_DISABLE_EXPLICIT_SYNC", None)));
+        // An explicit player setting, without our marker, belongs to the game's environment.
+        for value in ["0", "1"] {
+            assert!(changes_from(&|k| (k == "__NV_DISABLE_EXPLICIT_SYNC").then(|| value.to_string())).is_empty());
+        }
     }
 
     #[test]
-    fn shared_memory_gpu_path_requires_nvidia_wayland_and_a_render_node() {
-        assert!(!graphics_shared_memory("", false, false, false, true, true));
-        assert!(!graphics_shared_memory("", false, false, true, false, true));
-        assert!(!graphics_shared_memory("", false, false, true, true, false));
+    fn games_do_not_inherit_launcher_added_shared_memory_transfer() {
+        let env = HashMap::from([(OWN_WEBKIT_SHM, "1"), ("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1")]);
+        let changes = changes_from(&|k| env.get(k).map(|s| s.to_string()));
+        assert!(changes.contains(&(OWN_WEBKIT_SHM, None)));
+        assert!(changes.contains(&("WEBKIT_DMABUF_RENDERER_FORCE_SHM", None)));
+    }
+
+    #[test]
+    fn games_keep_the_players_explicit_shared_memory_setting() {
+        for value in ["0", "1"] {
+            assert!(changes_from(&|k| (k == "WEBKIT_DMABUF_RENDERER_FORCE_SHM").then(|| value.to_string())).is_empty());
+        }
+    }
+
+    #[test]
+    fn shared_memory_frame_transfer_keeps_gpu_rendering() {
+        let env = HashMap::from([("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1")]);
+        assert!(!draws_on_cpu_from(&|k| env.get(k).map(|v| v.to_string()), true));
+    }
+
+    #[test]
+    fn the_safe_renderer_draws_on_the_processor() {
+        let env = HashMap::from([("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]);
+        assert!(draws_on_cpu_from(&|k| env.get(k).map(|v| v.to_string()), true));
+    }
+
+    #[test]
+    fn compositing_off_draws_on_the_processor() {
+        let env = HashMap::from([("WEBKIT_DISABLE_COMPOSITING_MODE", "1")]);
+        assert!(draws_on_cpu_from(&|k| env.get(k).map(|v| v.to_string()), true));
+    }
+
+    #[test]
+    fn no_render_node_draws_on_the_processor() {
+        assert!(draws_on_cpu_from(&|_| None, false));
+    }
+
+    #[test]
+    fn the_default_renderer_on_a_gpu_draws_on_the_gpu() {
+        assert!(!draws_on_cpu_from(&|_| None, true));
+    }
+
+    #[test]
+    fn a_variable_set_to_zero_leaves_the_gpu_on() {
+        let env = HashMap::from([("WEBKIT_DISABLE_DMABUF_RENDERER", "0"), ("WEBKIT_DISABLE_COMPOSITING_MODE", "0")]);
+        assert!(!draws_on_cpu_from(&|k| env.get(k).map(|v| v.to_string()), true));
     }
 
     #[test]
@@ -510,20 +610,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn auto_keeps_appimages_on_the_fast_path_when_a_gpu_is_there() {
         // AMD/Intel desktop AppImage: the default renderer is fine and much cheaper.
-        assert!(!graphics_safe_way("", false, false, false, true, true));
+        assert_eq!(graphics_workarounds("", false, false, false, false, true, true), GraphicsWorkarounds::default());
+        assert_eq!(graphics_workarounds("", false, false, false, true, true, true), GraphicsWorkarounds::default());
         // No render node (a VM, a remote display, software rendering): keep the safe renderer.
-        assert!(graphics_safe_way("", false, false, false, true, false));
-        // NVIDIA, Steam and Gaming Mode keep it too.
-        assert!(graphics_safe_way("", false, false, true, true, true));
-        assert!(graphics_safe_way("", false, true, false, false, true));
-        assert!(graphics_safe_way("", true, false, false, false, true));
-        // The player's choice wins over the guess.
-        assert!(!graphics_safe_way("fast", true, true, true, true, true));
-        assert!(graphics_safe_way("safe", false, false, false, false, true));
+        let fallback = GraphicsWorkarounds { dmabuf_off: true, ..Default::default() };
+        assert_eq!(graphics_workarounds("", false, false, false, false, true, false), fallback);
+        // NVIDIA X11, Steam and Gaming Mode keep their existing transport workaround.
+        assert_eq!(graphics_workarounds("", false, false, true, false, true, true), fallback);
+        assert_eq!(graphics_workarounds("", false, true, false, false, false, true), fallback);
+        assert_eq!(graphics_workarounds("", true, false, false, false, false, true), fallback);
     }
 
     #[test]
